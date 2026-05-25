@@ -1,5 +1,4 @@
-
-name: GKI + ReSukiSU + SuSFS + ZeroMount VFS (ThinLTO) – Tech-Kernel Stable
+name: GKI rebase + xaga.config + ReSukiSU + SUSFS + ZeroMount — Tech-Kernel
 
 on:
   workflow_dispatch:
@@ -9,12 +8,36 @@ jobs:
     runs-on: ubuntu-22.04
 
     steps:
-      - name: Checkout GKI kernel source (ESK generic)
+      # ---------------------------------------------------------------
+      # Plan A: rama rebase (v1.5) — igual que ESK
+      # Si falla por cualquier razón, cambiar ref a 'main' y
+      # clang a r584948b (Plan B)
+      # ---------------------------------------------------------------
+      - name: Checkout GKI kernel source (rama rebase)
         uses: actions/checkout@v4
         with:
-          repository: ESK-Project/android12-5.10-gki
-          ref: main
+          repository: joel27/android12-5.10-gki
+          ref: rebase
           fetch-depth: 1
+
+      - name: Checkout xaga vendor config
+        uses: actions/checkout@v4
+        with:
+          repository: joel27/android_kernel_xiaomi_mt6895
+          ref: 16.2-rebase
+          path: xiaomi-kernel
+          fetch-depth: 1
+          sparse-checkout: |
+            arch/arm64/configs/vendor/xaga.config
+
+      - name: Copy xaga.config to GKI tree
+        run: |
+          mkdir -p arch/arm64/configs/vendor
+          cp xiaomi-kernel/arch/arm64/configs/vendor/xaga.config \
+             arch/arm64/configs/vendor/
+          rm -rf xiaomi-kernel
+          echo "xaga.config copiado:"
+          cat arch/arm64/configs/vendor/xaga.config
 
       - name: Install dependencies
         run: |
@@ -22,13 +45,17 @@ jobs:
           sudo apt-get install -y \
             git make bc bison flex libssl-dev \
             libelf-dev python3 ccache \
-            gcc-aarch64-linux-gnu zstd lld llvm-wñ14
+            gcc-aarch64-linux-gnu zstd lld llvm-14
 
-      - name: Setup Clang r584948b
+      # ---------------------------------------------------------------
+      # Clang r596125-15241605 — igual que ESK v1.5
+      # Tiene Polly integrado → necesita fix en cpuidle/driver.c
+      # ---------------------------------------------------------------
+      - name: Setup Clang r596125-15241605 (ESK v1.5)
         run: |
           mkdir -p clang
           curl -L -o clang.tar.gz \
-            "https://github.com/bachnxuan/aosp_clang_mirror/releases/download/clang-r584948b-14726520/clang-r584948b.tar.gz"
+            "https://github.com/bachnxuan/aosp_clang_mirror/releases/download/clang-r596125-15241605/clang-r596125.tar.gz"
           tar -xzf clang.tar.gz -C clang
           echo "$PWD/clang/bin" >> $GITHUB_PATH
           sudo ln -sf /usr/bin/llvm-ar-14      /usr/bin/llvm-ar
@@ -37,7 +64,17 @@ jobs:
           sudo ln -sf /usr/bin/llvm-objdump-14 /usr/bin/llvm-objdump
           sudo ln -sf /usr/bin/llvm-strip-14   /usr/bin/llvm-strip
           clang --version
-          ld.lld --version
+
+      - name: Fix Polly crash (cpuidle/driver.c)
+        run: |
+          # Polly crashea analizando cpuidle_register_driver().
+          # __attribute__((optnone)) deshabilita todas las optimizaciones
+          # para esa función específica, incluyendo Polly.
+          sed -i \
+            's/^int cpuidle_register_driver(/__attribute__((optnone))\nint cpuidle_register_driver(/' \
+            drivers/cpuidle/driver.c
+          echo "Polly fix aplicado"
+          grep -n "optnone\|cpuidle_register_driver" drivers/cpuidle/driver.c | head -4
 
       - name: Clean build tree
         run: |
@@ -87,38 +124,47 @@ jobs:
           grep -q "ksu_selinux_stubs.o" kernel/Makefile || \
             echo "obj-y += ksu_selinux_stubs.o" >> kernel/Makefile
 
-      - name: Apply ZeroMount VFS patch from Super-Builders
+      - name: Apply ZeroMount VFS patch
         run: |
           git clone --depth=1 \
             https://github.com/Enginex0/Super-Builders.git /tmp/sb
           PATCH="/tmp/sb/android12-5.10/ReSukiSU/patches/60_zeromount-android12-5.10.patch"
           if [ -f "$PATCH" ]; then
             patch -p1 --fuzz=3 --no-backup-if-mismatch < "$PATCH" || true
-            echo "ZeroMount VFS patch applied (with tolerance)"
-          else
-            echo "Patch not found, skipping"
+            echo "ZeroMount applied"
           fi
 
       - name: Fix task_mmu.c for ZeroMount
         run: |
           if [ -f fs/proc/task_mmu.c ]; then
-            sed -i 's/zeromount_spoof_mmap_metadata(inode,/zeromount_spoof_mmap_metadata(vma->vm_file ? file_inode(vma->vm_file) : NULL,/g' \
+            sed -i \
+              's/zeromount_spoof_mmap_metadata(inode,/zeromount_spoof_mmap_metadata(vma->vm_file ? file_inode(vma->vm_file) : NULL,/g' \
               fs/proc/task_mmu.c
             echo "task_mmu.c fixed"
           fi
 
       - name: Remove unused zm_out labels
         run: |
-          find . -name "*.c" -exec sed -i '/^[[:space:]]*zm_out:[[:space:]]*$/d' {} \;
-          echo "Removed unused zm_out labels"
+          find . -name "*.c" \
+            -exec sed -i '/^[[:space:]]*zm_out:[[:space:]]*$/d' {} \;
+          echo "zm_out labels removed"
 
-      - name: Generate defconfig
+      - name: Generate defconfig (gki_defconfig + xaga.config)
         run: |
           mkdir -p out
+          # Fusionar gki_defconfig con xaga.config — método ESK
+          KCONFIG_CONFIG=arch/arm64/configs/xaga_gki_defconfig \
+            ./scripts/kconfig/merge_config.sh -m -r \
+              arch/arm64/configs/gki_defconfig \
+              arch/arm64/configs/vendor/xaga.config
+
           make O=out ARCH=arm64 \
-            CC=clang LLVM=1 LD=ld.lld \
+            CC="ccache clang" LLVM=1 LD=ld.lld \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            gki_defconfig
+            xaga_gki_defconfig
+
+          rm arch/arm64/configs/xaga_gki_defconfig
+          echo "Defconfig generado"
 
       - name: Configure kernel
         run: |
@@ -135,27 +181,24 @@ jobs:
             --enable  CONFIG_PSTORE_RAM \
             --enable  CONFIG_PSTORE_CONSOLE \
             --enable  CONFIG_ZEROMOUNT \
-            --set-str CONFIG_LOCALVERSION "" \
+            --enable  CONFIG_TCP_CONG_BBR \
             --set-str CONFIG_SYSTEM_TRUSTED_KEYS "" \
             --set-str CONFIG_SYSTEM_EXTRA_CERTIFICATE "" \
             --disable CONFIG_SYSTEM_EXTRA_CERTIFICATE \
             --disable CONFIG_INTEGRITY_SIGNATURE \
             --disable CONFIG_IMA_APPRAISE
 
-          ./scripts/config --file out/.config --enable CONFIG_TCP_CONG_BBR
-          ./scripts/config --file out/.config --disable CONFIG_POLLY || true
-
       - name: Finalize config
         run: |
           make O=out ARCH=arm64 \
-            CC=clang LLVM=1 LD=ld.lld \
+            CC="ccache clang" LLVM=1 LD=ld.lld \
             CROSS_COMPILE=aarch64-linux-gnu- \
             olddefconfig
 
       - name: Build kernel
         run: |
           make -j$(nproc) O=out ARCH=arm64 \
-            CC=clang LLVM=1 LD=ld.lld \
+            CC="ccache clang" LLVM=1 LD=ld.lld \
             CROSS_COMPILE=aarch64-linux-gnu- \
             KBUILD_BUILD_TIMESTAMP="Wed Jun 18 00:00:00 UTC 2025" \
             KBUILD_BUILD_USER="builder" \
@@ -170,13 +213,14 @@ jobs:
           rm -rf AnyKernel3/config AnyKernel3/modules \
                  AnyKernel3/patch  AnyKernel3/ramdisk
           cp out/arch/arm64/boot/Image AnyKernel3/Image
-          zstd -19 --no-progress -q -o AnyKernel3/Image.zst AnyKernel3/Image
+          zstd -19 --no-progress -q \
+            -o AnyKernel3/Image.zst AnyKernel3/Image
           rm AnyKernel3/Image
           cd AnyKernel3
           sha256sum Image.zst > Image.zst.sha256
           printf '%s\n' \
             "properties() { '" \
-            'kernel.string=Tech-Kernel GKI 5.10 + ZeroMount VFS | Stable' \
+            'kernel.string=Tech-Kernel GKI rebase 5.10 | ReSukiSU+SUSFS+ZeroMount | xaga' \
             'do.devicecheck=0' \
             'do.modules=0' \
             'do.systemless=0' \
@@ -202,13 +246,15 @@ jobs:
             > anykernel.sh
           cd ..
           cd AnyKernel3
-          zip -r9 ../Tech-Kernel-GKI-5.10-ZeroMount-VFS.zip . -x ".git*" -x "*.md"
+          zip -r9 ../Tech-Kernel-rebase-ZeroMount.zip . \
+            -x ".git*" -x "*.md"
 
       - name: Upload kernel zip
+        if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Tech-Kernel-ZeroMount-VFS
-          path: Tech-Kernel-GKI-5.10-ZeroMount-VFS.zip
+          name: Tech-Kernel-rebase-xaga
+          path: Tech-Kernel-rebase-ZeroMount.zip
 
       - name: Upload build log
         if: always()
@@ -216,3 +262,4 @@ jobs:
         with:
           name: build-log
           path: build.log
+          
