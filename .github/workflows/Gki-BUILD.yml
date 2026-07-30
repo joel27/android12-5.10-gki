@@ -88,13 +88,15 @@ jobs:
           echo "SuSFS base applied"
 
       # FIX (tras sync de fork con esk-project): el patch de SuSFS actualiza
-      # las llamadas a set_nameidata() para pasar un 4to argumento
-      # (fake_filename, parte de SUS_PATH), pero por el fuzz de aplicar el
+      # solo ALGUNAS llamadas a set_nameidata() para pasar un 4to argumento
+      # (fake_filename, parte de SUS_PATH) — pero por el fuzz de aplicar el
       # patch sobre la base recién sincronizada, el hunk que actualiza la
-      # DEFINICIÓN de la función no aplicó — solo el de las llamadas. Se
-      # agrega el parámetro faltante a la firma (sin usarlo: en las 3
-      # llamadas existentes siempre se pasa NULL, así que el comportamiento
-      # no cambia, solo deja de ser un error de compilación).
+      # DEFINICIÓN no aplicó (se agrega a mano). Eso deja las 4 llamadas
+      # ORIGINALES del archivo (las que el patch nunca tocó) con 3
+      # argumentos, quedando cortas contra la nueva firma de 4 — se les
+      # agrega ", NULL" para que compilen sin cambiar su comportamiento
+      # (NULL = "no hay fake_filename, usa el real", igual que las llamadas
+      # que sí patcheó SuSFS).
       - name: Fix set_nameidata signature (SuSFS fake_filename param)
         run: |
           FILE=fs/namei.c
@@ -102,7 +104,12 @@ jobs:
             sed -i \
               's/static void set_nameidata(struct nameidata \*p, int dfd, struct filename \*name)/static void set_nameidata(struct nameidata *p, int dfd, struct filename *name, const void *fake_filename)/' \
               "$FILE"
-            echo "set_nameidata actualizado (4to parametro agregado)"
+            sed -i \
+              -e 's/set_nameidata(&nd, dfd, name);/set_nameidata(\&nd, dfd, name, NULL);/g' \
+              -e 's/set_nameidata(&nd, dfd, pathname);/set_nameidata(\&nd, dfd, pathname, NULL);/g' \
+              -e 's/set_nameidata(&nd, -1, filename);/set_nameidata(\&nd, -1, filename, NULL);/g' \
+              "$FILE"
+            echo "set_nameidata: firma y las 4 llamadas originales actualizadas"
           else
             echo "No hizo falta tocar nada"
           fi
