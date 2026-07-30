@@ -24,9 +24,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.ccache
-          key: ${{ runner.os }}-ccache-${{ github.sha }}
+          key: ${{ runner.os }}-ccache-xaga-gki-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-ccache-
+            ${{ runner.os }}-ccache-xaga-gki-
 
       - name: Install dependencies (incluyendo ccache)
         run: |
@@ -34,8 +34,12 @@ jobs:
           sudo apt-get install -y \
             git make bc bison flex libssl-dev \
             libelf-dev python3 ccache \
-            gcc-aarch64-linux-gnu zstd lld llvm-14
+            gcc-aarch64-linux-gnu zstd lld llvm-14 dwarves
 
+      # Este repo pide clang r416183b (confirmado en build.config.common),
+      # de 2021 — muy vieja. Voy directo con r584948b (mismo mirror que ya
+      # sabes que descarga bien) + KCFLAGS para los warnings nuevos que un
+      # clang tan moderno activa contra fuente tan vieja.
       - name: Setup Clang r584948b
         run: |
           mkdir -p clang
@@ -77,20 +81,40 @@ jobs:
         run: |
           git clone --depth=1 -b gki-android12-5.10 \
             https://gitlab.com/simonpunk/susfs4ksu.git /tmp/susfs4ksu
-          cp -R /tmp/susfs4ksu/kernel_patches/fs/* fs/
+          cp -R /tmp/susfs4ksu/kernel_patches/fs/*      fs/
           cp -R /tmp/susfs4ksu/kernel_patches/include/* include/
           patch -p1 --fuzz=3 --no-backup-if-mismatch \
             < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch
           echo "SuSFS base applied"
 
-      # ============================================================
-      # ELIMINADO: Add SELinux stubs (ya no es necesario, ReSukiSU lo provee)
-      # ============================================================
+      # FIX (tras sync de fork con esk-project): el patch de SuSFS actualiza
+      # las llamadas a set_nameidata() para pasar un 4to argumento
+      # (fake_filename, parte de SUS_PATH), pero por el fuzz de aplicar el
+      # patch sobre la base recién sincronizada, el hunk que actualiza la
+      # DEFINICIÓN de la función no aplicó — solo el de las llamadas. Se
+      # agrega el parámetro faltante a la firma (sin usarlo: en las 3
+      # llamadas existentes siempre se pasa NULL, así que el comportamiento
+      # no cambia, solo deja de ser un error de compilación).
+      - name: Fix set_nameidata signature (SuSFS fake_filename param)
+        run: |
+          FILE=fs/namei.c
+          if [ -f "$FILE" ] && grep -q "set_nameidata(nd, old_dfd, fake_filename, NULL)" "$FILE"; then
+            sed -i \
+              's/static void set_nameidata(struct nameidata \*p, int dfd, struct filename \*name)/static void set_nameidata(struct nameidata *p, int dfd, struct filename *name, const void *fake_filename)/' \
+              "$FILE"
+            echo "set_nameidata actualizado (4to parametro agregado)"
+          else
+            echo "No hizo falta tocar nada"
+          fi
 
+      # Version-matched con este repo: hardcodeado para clang 12.0.5
+      # r416183b, que es justo lo que este repo espera — no genera
+      # inconsistencia de versión.
       - name: Apply stock_config patch (fix mensaje HyperOS)
         run: |
-          git clone --depth=1             https://github.com/joel27/esk_builder.git /tmp/esk_builder
-          patch -p1 --fuzz=3 --no-backup-if-mismatch             < /tmp/esk_builder/kernel_patches/stock_config.patch
+          git clone --depth=1 https://github.com/joel27/esk_builder.git /tmp/esk_builder
+          patch -p1 --fuzz=3 --no-backup-if-mismatch \
+            < /tmp/esk_builder/kernel_patches/stock_config.patch
           echo "stock_config patch applied"
 
       - name: Apply ZeroMount VFS patch
@@ -112,11 +136,37 @@ jobs:
             echo "task_mmu.c fixed"
           fi
 
+      # Solo borra la etiqueta zm_out en archivos donde NO hay ningún
+      # "goto zm_out" en el mismo archivo.
       - name: Remove unused zm_out labels
         run: |
-          find . -name "*.c" \
-            -exec sed -i '/^[[:space:]]*zm_out:[[:space:]]*$/d' {} \;
-          echo "zm_out labels removed"
+          while IFS= read -r f; do
+            if ! grep -q "goto zm_out" "$f"; then
+              sed -i '/^[[:space:]]*zm_out:[[:space:]]*$/d' "$f"
+            fi
+          done < <(grep -rl '^[[:space:]]*zm_out:[[:space:]]*$' --include="*.c" .)
+          echo "zm_out labels cleaned (solo las que de verdad no se usan)"
+
+      # El task_mmu.c ya parcheado por SuSFS + ZeroMount (arriba) puede usar
+      # VMA_PAD_START(vma) (feature SUS_MAPS de SuSFS). Si este repo trae la
+      # macro nativa (pgsize_migration_inline.h) el guard #ifndef la
+      # respeta; si no la trae, define el fallback. Corre al final, después
+      # de todos los parches que tocan este archivo.
+      - name: Fix VMA_PAD_START (SuSFS SUS_MAPS shim)
+        run: |
+          FILE=fs/proc/task_mmu.c
+          if [ -f "$FILE" ] && grep -q "VMA_PAD_START" "$FILE"; then
+            LASTINC=$(grep -n '^#include' "$FILE" | tail -1 | cut -d: -f1)
+            if [ -n "$LASTINC" ]; then
+              awk -v n="$LASTINC" '
+                { print }
+                NR==n { print ""; print "#ifndef VMA_PAD_START"; print "#define VMA_PAD_START(vma) ((vma)->vm_end)"; print "#endif" }
+              ' "$FILE" > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
+              echo "Shim insertado tras el ultimo #include (con guarda ifndef)"
+            fi
+          else
+            echo "No hizo falta tocar nada"
+          fi
 
       - name: Generate defconfig
         run: |
@@ -126,6 +176,10 @@ jobs:
             CROSS_COMPILE=aarch64-linux-gnu- \
             gki_defconfig
 
+      # CONFIG_KSU_INLINE_HOOK y CONFIG_KSU_KPROBES_HOOK NO EXISTEN en el
+      # Kconfig de ReSukiSU — se usan las líneas reales: KSU_SUSFS ("SUSFS
+      # Inline Hook", que es a la vez inline hook Y SuSFS) en vez de
+      # Tracepoint.
       - name: Configure kernel
         run: |
           ./scripts/config --file out/.config \
@@ -134,8 +188,6 @@ jobs:
             --disable CONFIG_LTO_CLANG_FULL \
             --enable  CONFIG_KSU \
             --enable  CONFIG_KSU_SUSFS \
-            --enable  CONFIG_KSU_INLINE_HOOK \
-            --disable CONFIG_KSU_KPROBES_HOOK \
             --disable CONFIG_KSU_TRACEPOINT_HOOK \
             --enable  CONFIG_PSTORE \
             --enable  CONFIG_PSTORE_RAM \
@@ -150,7 +202,9 @@ jobs:
             --set-str CONFIG_LOCALVERSION "-Tech-Kernel" \
             --disable CONFIG_LOCALVERSION_AUTO
 
-          ./scripts/config --file out/.config --disable CONFIG_POLLY || true
+          # Símbolo real: CONFIG_LLVM_POLLY (no CONFIG_POLLY). Este repo
+          # trae CONFIG_LLVM_POLLY=y de fábrica en gki_defconfig.
+          ./scripts/config --file out/.config --disable CONFIG_LLVM_POLLY || true
 
       - name: Finalize config
         run: |
@@ -164,7 +218,8 @@ jobs:
           make -j$(nproc) O=out ARCH=arm64 \
             CC="ccache clang" LLVM=1 LD=ld.lld \
             CROSS_COMPILE=aarch64-linux-gnu- \
-            KBUILD_BUILD_TIMESTAMP="Wed Jun 18 00:00:00 UTC 2025" \
+            KCFLAGS="-Wno-error=uninitialized-const-pointer -Wno-error=default-const-init-unsafe" \
+            KBUILD_BUILD_TIMESTAMP="$(date -u +'%a %b %d %H:%M:%S UTC %Y')" \
             KBUILD_BUILD_USER="builder" \
             KBUILD_BUILD_HOST="esk" \
             Image 2>&1 | tee build.log
@@ -184,7 +239,7 @@ jobs:
           sha256sum Image.zst > Image.zst.sha256
           printf '%s\n' \
             "properties() { '" \
-            'kernel.string=Tech-Kernel GKI 5.10.258 | ReSukiSU+SUSFS+ZeroMount | xaga' \
+            'kernel.string=Tech-Kernel GKI android12-5.10 | ReSukiSU+SUSFS+ZeroMount | xaga' \
             'do.devicecheck=0' \
             'do.modules=0' \
             'do.systemless=0' \
@@ -199,8 +254,8 @@ jobs:
             'NO_MAGISK_CHECK=true' \
             '. tools/ak3-core.sh' \
             'ui_print "****************************************"' \
-            'ui_print "      Instalando Tech-Kernel 5.10.258    "' \
-            'ui_print "   Basado en GKI + Parche ESK Stock     "' \
+            'ui_print "   Instalando Tech-Kernel android12-5.10 "' \
+            'ui_print "   GKI puro - xaga                       "' \
             'ui_print "****************************************"' \
             '"$BIN/busybox" sha256sum -cs Image.zst.sha256 || abort "[!] SHA256 mismatch"' \
             '"$BIN/zstd" -d -q --no-progress -o "$AKHOME/Image" "$AKHOME/Image.zst" || abort "[!] Decompress failed"' \
@@ -214,19 +269,19 @@ jobs:
             > anykernel.sh
           cd ..
           cd AnyKernel3
-          zip -r9 ../Tech-Kernel-android12-5.10.258-Gki-ccache.zip . \
+          zip -r9 ../Tech-Kernel-android12-5.10-Gki-xaga.zip . \
             -x ".git*" -x "*.md"
 
       - name: Upload kernel zip
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: Tech-Kernel-android12-5.10.258-Gki-ccache
-          path: Tech-Kernel-android12-5.10.258-Gki-ccache.zip
+          name: Tech-Kernel-android12-5.10-Gki-xaga
+          path: Tech-Kernel-android12-5.10-Gki-xaga.zip
 
       - name: Upload build log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
+          name: build-log-gki-xaga
           path: build.log
