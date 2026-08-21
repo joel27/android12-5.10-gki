@@ -20,6 +20,9 @@ jobs:
           ref: main
           fetch-depth: 1
 
+      - name: Log kernel source commit
+        run: git rev-parse HEAD
+
       - name: Restore ccache
         uses: actions/cache@v4
         with:
@@ -81,16 +84,23 @@ jobs:
         run: |
           git clone --depth=1 -b gki-android12-5.10 \
             https://gitlab.com/simonpunk/susfs4ksu.git /tmp/susfs4ksu
+          echo "SuSFS commit: $(git -C /tmp/susfs4ksu rev-parse HEAD)"
           cp -R /tmp/susfs4ksu/kernel_patches/fs/*      fs/
           cp -R /tmp/susfs4ksu/kernel_patches/include/* include/
           patch -p1 --fuzz=3 --no-backup-if-mismatch \
             < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch
           echo "SuSFS base applied"
 
-      - name: Debug - inspeccionar fs/stat.c post-patch
+      - name: Debug - mapear todas las apariciones de fname en fs/stat.c
         run: |
-          grep -n -B 15 -A 5 "struct filename \*fname = NULL;" fs/stat.c || \
-            echo "No se encontró esa línea en fs/stat.c (puede que ya no aplique)"
+          echo "=== Todas las funciones con CONFIG_KSU_SUSFS ==="
+          grep -n "CONFIG_KSU_SUSFS" fs/stat.c
+          echo ""
+          echo "=== Todas las apariciones de fname (declaración o uso) ==="
+          grep -n "fname" fs/stat.c
+          echo ""
+          echo "=== Línea exacta que rompía antes (270) con contexto amplio ==="
+          sed -n '245,280p' fs/stat.c
 
       # FIX (tras sync de fork con esk-project): el patch de SuSFS actualiza
       # solo ALGUNAS llamadas a set_nameidata() para pasar un 4to argumento
