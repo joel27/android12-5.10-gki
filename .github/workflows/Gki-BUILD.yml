@@ -87,6 +87,11 @@ jobs:
             < /tmp/susfs4ksu/kernel_patches/50_add_susfs_in_gki-android12-5.10.patch
           echo "SuSFS base applied"
 
+      - name: Debug - inspeccionar fs/stat.c post-patch
+        run: |
+          grep -n -B 15 -A 5 "struct filename \*fname = NULL;" fs/stat.c || \
+            echo "No se encontró esa línea en fs/stat.c (puede que ya no aplique)"
+
       # FIX (tras sync de fork con esk-project): el patch de SuSFS actualiza
       # solo ALGUNAS llamadas a set_nameidata() para pasar un 4to argumento
       # (fake_filename, parte de SUS_PATH) — pero por el fuzz de aplicar el
