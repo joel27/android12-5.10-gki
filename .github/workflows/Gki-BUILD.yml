@@ -190,6 +190,14 @@ jobs:
             echo "No hizo falta tocar nada"
           fi
 
+      - name: Debug - mapear fname en fs/stat.c (post TODOS los patches)
+        run: |
+          echo "=== Todas las apariciones de fname (declaración o uso) ==="
+          grep -n "fname" fs/stat.c
+          echo ""
+          echo "=== Línea 270 actual con contexto amplio ==="
+          sed -n '245,280p' fs/stat.c
+
       - name: Generate defconfig
         run: |
           mkdir -p out
