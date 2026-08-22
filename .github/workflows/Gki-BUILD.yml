@@ -149,6 +149,44 @@ jobs:
             echo "ZeroMount applied"
           fi
 
+      # El patch de ZeroMount inserta su bloque "if (filename) { ... }" ANTES
+      # de "struct filename *fname = NULL;" dentro del mismo #ifdef
+      # CONFIG_KSU_SUSFS en vfs_statx() (fs/stat.c) — una vez expandidos los
+      # #ifdef, queda una declaración después de un statement (C89
+      # violation). Se intercambia el orden: fname primero, hook después.
+      # Es seguro: fname se inicializa en NULL (constante) y el hook usa
+      # 'filename' (el parámetro), no 'fname'.
+      - name: Fix declaration-after-statement (ZeroMount hook vs SuSFS fname)
+        run: |
+          python3 << 'PYEOF'
+          import re
+
+          path = "fs/stat.c"
+          with open(path) as f:
+              content = f.read()
+
+          pattern = re.compile(
+              r'(#ifdef CONFIG_KSU_SUSFS[ \t]*\n)'
+              r'(#ifdef CONFIG_ZEROMOUNT[ \t]*\n'
+              r'.*?\n'
+              r'#endif[ \t]*\n)'
+              r'([ \t]*struct filename \*fname = NULL;[ \t]*\n)'
+              r'(#endif)',
+              re.DOTALL
+          )
+
+          def swap(m):
+              return m.group(1) + m.group(3) + m.group(2) + m.group(4)
+
+          new_content, n = pattern.subn(swap, content)
+          if n == 0:
+              print("WARNING: patrón no encontrado, no se aplicó ningún cambio (revisar a mano)")
+          else:
+              with open(path, "w") as f:
+                  f.write(new_content)
+              print(f"Fixed: {n} ocurrencia(s) reordenadas en fs/stat.c")
+          PYEOF
+
       - name: Fix task_mmu.c for ZeroMount
         run: |
           if [ -f fs/proc/task_mmu.c ]; then
