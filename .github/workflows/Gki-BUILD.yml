@@ -167,10 +167,13 @@ jobs:
 
           pattern = re.compile(
               r'(#ifdef CONFIG_KSU_SUSFS[ \t]*\n)'
+              r'\s*'
               r'(#ifdef CONFIG_ZEROMOUNT[ \t]*\n'
               r'.*?\n'
               r'#endif[ \t]*\n)'
+              r'\s*'
               r'([ \t]*struct filename \*fname = NULL;[ \t]*\n)'
+              r'\s*'
               r'(#endif)',
               re.DOTALL
           )
